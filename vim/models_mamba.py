@@ -24,6 +24,8 @@ from mamba_ssm.utils.hf import load_config_hf, load_state_dict_hf
 from rope import *
 import random
 
+from pom import prune, merge, hybrid_merge, hybrid_prune, pure_hybrid
+
 try:
     from mamba_ssm.ops.triton.layer_norm import RMSNorm, layer_norm_fn, rms_norm_fn
 except ImportError:
@@ -490,78 +492,133 @@ class VisionMamba(nn.Module):
                     hidden_states, residual, inference_params=inference_params
                 )
                 
-                #  ############################## token pruning ######################################### 
-                if (layernum - 5) >= 0 and (layernum - 5) % 5 == 0 and layernum < 20:
-                    # attn_heads = layer.mixer.xai_b.clamp(min=0) 
-                    #print('attn_heads.shape',attn_heads)
-                    # attn_heads = (attn_heads - attn_heads.min()) / (attn_heads.max() - attn_heads.min())  ##([1, 384, 197])
-                    # avg_heads = attn_heads.sum(dim=1).detach()
-                    avg_heads = layer.mixer.xai_b.sum(dim=1).detach()
+                prune_layers = {5, 10, 15}
+                if layernum in prune_layers:
+                #  ############################## ToR_SSM pruning ######################################### 
+                # if (layernum - 5) >= 0 and (layernum - 5) % 5 == 0 and layernum < 20:
+                    
+                    with torch.no_grad():
+                        attn_heads_1 = layer.mixer.xai_b.sum(dim=1).detach() # 重要性分数 (B,N)
+                        attn_heads = hidden_states.detach() # 相似度分数 (B,N,D)
+                        
+                        # attn_heads = attn_heads.clamp(min=0)
+                        # attn_heads = attn_heads.abs()
+                        # attn_heads = torch.pow(attn_heads, 2)
+                        # attn_heads = torch.std(attn_heads, dim=(-1), keepdim=True).log()
+                    
                     token_keep_ratio = 0.8
-                    #rollout = compute_rollout_attention(all_layer_attentions, start_layer= 0)
-                    B, N, D = hidden_states.shape #_, N, _ = rollout.shape
-                    #print('N',N)
+                    B, N, D = hidden_states.shape
+                    
                     cls_pos = N // 2
-                    #print('cls_pos',cls_pos)
-                    score_full = avg_heads #rollout[0 , cls_pos , :].unsqueeze(0)   #([1, 197])
-                    #print('score_full.shape',score_full.shape)
-                    score_nocls = score_full.clone()
-                    score_nocls[:, cls_pos] = float('-inf')
-                    #print('score_nocls.shape',score_nocls.shape)
-                    N_token = N-1
-                    num_keep_node = math.ceil( N_token * token_keep_ratio )     # 196 r
-                    #print('num_keep_node',num_keep_node)
-                    if num_keep_node % 2 == 0:
-                        num_keep_node += 1  # Adjust K to be odd if necessary
-                    # _, top_score_nocls = score_nocls.topk(num_keep_node - 1, dim=1, largest=True, sorted=True)
-                    _, top_score_nocls = score_nocls.topk(num_keep_node - 1, dim=1, largest=True)
-                    # print(hidden_states.shape)
-                    top_score_nocls, _ = torch.sort(top_score_nocls, dim=-1)
-                    # top_indices_excluding_cls = top_score_nocls.squeeze()
-                    top_indices_excluding_cls = top_score_nocls
-
-                    #print('top_indices_excluding_cls.shape',top_indices_excluding_cls.shape)
-                    ########s
                     cls_pos_tensor_hidden = hidden_states[:, cls_pos:cls_pos+1, :]
                     cls_pos_tensor_res = residual[:, cls_pos:cls_pos+1, :]
+                    
+                    # 切片取走cls_token 位置信息
+                    hidden_states = torch.cat((hidden_states[:, :cls_pos, :], hidden_states[:, cls_pos+1:, :]), dim=1)
+                    residual = torch.cat((residual[:, :cls_pos, :], residual[:, cls_pos+1:, :]), dim=1)
+                    # attn_heads = torch.cat((attn_heads[:, :cls_pos, :], attn_heads[:, cls_pos+1:, :]), dim=1)
+                    attn_heads_1 = torch.cat((attn_heads_1[:, :cls_pos], attn_heads_1[:, cls_pos+1:]), dim=1)
+                    attn_heads = torch.cat((attn_heads[:, :cls_pos], attn_heads[:, cls_pos+1:]), dim=1)
+                    # assert(0)
+                    
+                    N_token = N-1
+                    num_keep_node = math.ceil( N_token * token_keep_ratio )
+                    if num_keep_node % 2 == 0:
+                        num_keep_node += 1  # Adjust K to be odd if necessary
+                    
+                    # hidden_states = merge(hidden_states, attn_heads, num_keep_node - 1, preserve_length=False)
+                    # residual = merge(residual, attn_heads, num_keep_node - 1, preserve_length=False)
+                    
+                    # with torch.no_grad():
+                    # hidden_states = hybrid_prune(hidden_states, attn_heads_1, attn_heads, num_keep_node - 1, preserve_length=False)
+                    # residual = hybrid_prune(residual, attn_heads_1, attn_heads, num_keep_node - 1, preserve_length=False)
+                    
+                    hidden_states = hybrid_merge(hidden_states, attn_heads_1, attn_heads, num_keep_node - 1, preserve_length=False)
+                    residual = hybrid_merge(residual, attn_heads_1, attn_heads, num_keep_node - 1, preserve_length=False)
+                    
+                    # hidden_states = pure_hybrid(hidden_states, attn_heads_1, attn_heads, num_keep_node - 1, preserve_length=False)
+                    # residual = pure_hybrid(residual, attn_heads_1, attn_heads, num_keep_node - 1, preserve_length=False)
+                    
+                    # print('layer:',layernum ,' hidden_states: ', hidden_states.shape, ' residual: ', residual.shape)
+                    
+                    middle_position = hidden_states.size(1) // 2 
+                    
+                    hidden_states = torch.cat((hidden_states[:, :middle_position, :], cls_pos_tensor_hidden, hidden_states[:, middle_position:, :]), dim=1)
+                    residual = torch.cat((residual[:, :middle_position, :], cls_pos_tensor_res, residual[:, middle_position:, :]), dim=1)
 
-                    num_keep_node = math.ceil(N * token_keep_ratio)
-                    # if num_keep_node % 2 == 0:
-                    #     num_keep_node += 1  # Adjust K to be odd if necessary
-                    # _, top_score_nocls = score_nocls.topk(num_keep_node, dim=1)
-                    # top_score_nocls, _ = torch.sort(top_score_nocls, dim=-1)
-                    # hidden_states= torch.gather(hidden_states, 1, top_score_nocls[:, :, None].repeat(1, 1, hidden_states.size(-1)))
-                    # residual = torch.gather(residual, 1, top_score_nocls[:, :, None].repeat(1, 1, hidden_states.size(-1)))
+                
+                # #  ############################## token pruning ######################################### 
+                # if (layernum - 5) >= 0 and (layernum - 5) % 5 == 0 and layernum < 20:
+                #     # attn_heads = layer.mixer.xai_b.clamp(min=0) 
+                #     #print('attn_heads.shape',attn_heads)
+                #     # attn_heads = (attn_heads - attn_heads.min()) / (attn_heads.max() - attn_heads.min())  ##([1, 384, 197])
+                #     # avg_heads = attn_heads.sum(dim=1).detach()
+                #     avg_heads = layer.mixer.xai_b.sum(dim=1).detach()
+                #     token_keep_ratio = 0.8
+                #     #rollout = compute_rollout_attention(all_layer_attentions, start_layer= 0)
+                #     B, N, D = hidden_states.shape #_, N, _ = rollout.shape
+                #     #print('N',N)
+                #     cls_pos = N // 2
+                #     #print('cls_pos',cls_pos)
+                #     score_full = avg_heads #rollout[0 , cls_pos , :].unsqueeze(0)   #([1, 197])
+                #     #print('score_full.shape',score_full.shape)
+                #     score_nocls = score_full.clone()
+                #     score_nocls[:, cls_pos] = float('-inf')
+                #     #print('score_nocls.shape',score_nocls.shape)
+                #     N_token = N-1
+                #     num_keep_node = math.ceil( N_token * token_keep_ratio )     # 196 r
+                #     #print('num_keep_node',num_keep_node)
+                #     if num_keep_node % 2 == 0:
+                #         num_keep_node += 1  # Adjust K to be odd if necessary
+                #     # _, top_score_nocls = score_nocls.topk(num_keep_node - 1, dim=1, largest=True, sorted=True)
+                #     _, top_score_nocls = score_nocls.topk(num_keep_node - 1, dim=1, largest=True)
+                #     # print(hidden_states.shape)
+                #     top_score_nocls, _ = torch.sort(top_score_nocls, dim=-1)
+                #     # top_indices_excluding_cls = top_score_nocls.squeeze()
+                #     top_indices_excluding_cls = top_score_nocls
 
-                    #print('cls_pos_tensor.shape',cls_pos_tensor.shape)
-                    middle_position = top_score_nocls.size(1) // 2
-                    #print('middle_position',middle_position)
-                    first_half = top_indices_excluding_cls[:,:middle_position]
-                    #print('first_half.shape',first_half.shape)
-                    second_half = top_indices_excluding_cls[:,middle_position:]
-                    #print('second_half.shape',second_half.shape)
-                    # Using torch.gather to extract the corresponding tokens
+                #     #print('top_indices_excluding_cls.shape',top_indices_excluding_cls.shape)
+                #     ########s
+                #     cls_pos_tensor_hidden = hidden_states[:, cls_pos:cls_pos+1, :]
+                #     cls_pos_tensor_res = residual[:, cls_pos:cls_pos+1, :]
 
-                    # first_half_hidden= torch.gather(hidden_states, 1, first_half.unsqueeze(-1).expand(B, -1, hidden_states.size(2)))
-                    # second_half_hidden = torch.gather(hidden_states, 1, second_half.unsqueeze(-1).expand(B, -1, hidden_states.size(2)))
-                    # hidden_states = torch.cat((first_half_hidden, cls_pos_tensor_hidden, second_half_hidden), dim=1)
+                #     num_keep_node = math.ceil(N * token_keep_ratio)
+                #     # if num_keep_node % 2 == 0:
+                #     #     num_keep_node += 1  # Adjust K to be odd if necessary
+                #     # _, top_score_nocls = score_nocls.topk(num_keep_node, dim=1)
+                #     # top_score_nocls, _ = torch.sort(top_score_nocls, dim=-1)
+                #     # hidden_states= torch.gather(hidden_states, 1, top_score_nocls[:, :, None].repeat(1, 1, hidden_states.size(-1)))
+                #     # residual = torch.gather(residual, 1, top_score_nocls[:, :, None].repeat(1, 1, hidden_states.size(-1)))
 
-                    # first_half_res = torch.gather(residual, 1, first_half.unsqueeze(-1).expand(B, -1, residual.size(2)))
-                    # second_half_res = torch.gather(residual, 1, second_half.unsqueeze(-1).expand(B, -1, residual.size(2)))
-                    # residual = torch.cat((first_half_res, cls_pos_tensor_res, second_half_res), dim=1)
+                #     #print('cls_pos_tensor.shape',cls_pos_tensor.shape)
+                #     middle_position = top_score_nocls.size(1) // 2
+                #     #print('middle_position',middle_position)
+                #     first_half = top_indices_excluding_cls[:,:middle_position]
+                #     #print('first_half.shape',first_half.shape)
+                #     second_half = top_indices_excluding_cls[:,middle_position:]
+                #     #print('second_half.shape',second_half.shape)
+                #     # Using torch.gather to extract the corresponding tokens
 
-                    first_half_hidden = torch.gather(hidden_states, 1, first_half[:, :, None].repeat(1, 1, hidden_states.size(-1)))
-                    second_half_hidden = torch.gather(hidden_states, 1, second_half[:, :, None].repeat(1, 1, hidden_states.size(-1)))
-                    hidden_states = torch.cat((first_half_hidden, cls_pos_tensor_hidden, second_half_hidden), dim=1)
+                #     # first_half_hidden= torch.gather(hidden_states, 1, first_half.unsqueeze(-1).expand(B, -1, hidden_states.size(2)))
+                #     # second_half_hidden = torch.gather(hidden_states, 1, second_half.unsqueeze(-1).expand(B, -1, hidden_states.size(2)))
+                #     # hidden_states = torch.cat((first_half_hidden, cls_pos_tensor_hidden, second_half_hidden), dim=1)
 
-                    first_half_res = torch.gather(residual, 1, first_half[:, :, None].repeat(1, 1, residual.size(-1)))
-                    second_half_res = torch.gather(residual, 1, second_half[:, :, None].repeat(1, 1, residual.size(-1)))
-                    residual = torch.cat((first_half_res, cls_pos_tensor_res, second_half_res), dim=1)
+                #     # first_half_res = torch.gather(residual, 1, first_half.unsqueeze(-1).expand(B, -1, residual.size(2)))
+                #     # second_half_res = torch.gather(residual, 1, second_half.unsqueeze(-1).expand(B, -1, residual.size(2)))
+                #     # residual = torch.cat((first_half_res, cls_pos_tensor_res, second_half_res), dim=1)
 
-                    # print(hidden_states)
-                    # print(residual)
+                #     first_half_hidden = torch.gather(hidden_states, 1, first_half[:, :, None].repeat(1, 1, hidden_states.size(-1)))
+                #     second_half_hidden = torch.gather(hidden_states, 1, second_half[:, :, None].repeat(1, 1, hidden_states.size(-1)))
+                #     hidden_states = torch.cat((first_half_hidden, cls_pos_tensor_hidden, second_half_hidden), dim=1)
 
-                    # print('hidden_states.shape, residual.shape',hidden_states.shape, residual.shape)
+                #     first_half_res = torch.gather(residual, 1, first_half[:, :, None].repeat(1, 1, residual.size(-1)))
+                #     second_half_res = torch.gather(residual, 1, second_half[:, :, None].repeat(1, 1, residual.size(-1)))
+                #     residual = torch.cat((first_half_res, cls_pos_tensor_res, second_half_res), dim=1)
+
+                #     # print(hidden_states)
+                #     # print(residual)
+
+                #     # print('hidden_states.shape, residual.shape',hidden_states.shape, residual.shape)
         else:
             # get two layers in a single for-loop
             for i in range(len(self.layers) // 2):
