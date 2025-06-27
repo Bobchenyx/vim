@@ -238,6 +238,10 @@ class Mamba(nn.Module):
                     delta_bias=self.dt_proj_b.bias.float(),
                     delta_softplus=True,
                 )
+                
+                self.xai_b = out_b
+                # print('out_b.shape',out_b.shape)
+                
                 # F.linear(rearrange(out_z, "b d l -> b l d"), out_proj_weight, out_proj_bias)
                 if not self.if_divide_out:
                     out = F.linear(rearrange(out + out_b.flip([-1]), "b d l -> b l d"), self.out_proj.weight, self.out_proj.bias)

@@ -283,7 +283,7 @@ def main(args):
 
     data_loader_val = torch.utils.data.DataLoader(
         dataset_val, sampler=sampler_val,
-        batch_size=int(1.5 * args.batch_size * 20),
+        batch_size=int(1.5 * args.batch_size * 10),
         num_workers=args.num_workers,
         pin_memory=args.pin_mem,
         drop_last=False
@@ -466,8 +466,8 @@ def main(args):
         test_stats = evaluate(data_loader_val, model, device, amp_autocast)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
 
-        test_stats = evaluate(data_loader_val, model_ema.ema, device, amp_autocast)
-        print(f"Accuracy of the ema network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
+        # test_stats = evaluate(data_loader_val, model_ema.ema, device, amp_autocast)
+        # print(f"Accuracy of the ema network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
         return
     
     # log about

@@ -461,6 +461,9 @@ class VisionMamba(nn.Module):
         # mamba impl
         residual = None
         hidden_states = x
+        layernum = 0
+        #print('token_position', token_position)
+        #print('before x.shape', x.shape)
         if not self.if_bidirectional:
             for layer in self.layers:
 
@@ -479,10 +482,86 @@ class VisionMamba(nn.Module):
                     hidden_states = hidden_states.flip([1])
                     if residual is not None:
                         residual = residual.flip([1])
+                        
+                layernum += 1
+                # print('layernum : ',layernum, ' hidden_states : ', hidden_states.shape) # 197 - 157 - 125 - 101
 
                 hidden_states, residual = layer(
                     hidden_states, residual, inference_params=inference_params
                 )
+                
+                #  ############################## token pruning ######################################### 
+                if (layernum - 5) >= 0 and (layernum - 5) % 5 == 0 and layernum < 20:
+                    # attn_heads = layer.mixer.xai_b.clamp(min=0) 
+                    #print('attn_heads.shape',attn_heads)
+                    # attn_heads = (attn_heads - attn_heads.min()) / (attn_heads.max() - attn_heads.min())  ##([1, 384, 197])
+                    # avg_heads = attn_heads.sum(dim=1).detach()
+                    avg_heads = layer.mixer.xai_b.sum(dim=1).detach()
+                    token_keep_ratio = 0.8
+                    #rollout = compute_rollout_attention(all_layer_attentions, start_layer= 0)
+                    B, N, D = hidden_states.shape #_, N, _ = rollout.shape
+                    #print('N',N)
+                    cls_pos = N // 2
+                    #print('cls_pos',cls_pos)
+                    score_full = avg_heads #rollout[0 , cls_pos , :].unsqueeze(0)   #([1, 197])
+                    #print('score_full.shape',score_full.shape)
+                    score_nocls = score_full.clone()
+                    score_nocls[:, cls_pos] = float('-inf')
+                    #print('score_nocls.shape',score_nocls.shape)
+                    N_token = N-1
+                    num_keep_node = math.ceil( N_token * token_keep_ratio )     # 196 r
+                    #print('num_keep_node',num_keep_node)
+                    if num_keep_node % 2 == 0:
+                        num_keep_node += 1  # Adjust K to be odd if necessary
+                    # _, top_score_nocls = score_nocls.topk(num_keep_node - 1, dim=1, largest=True, sorted=True)
+                    _, top_score_nocls = score_nocls.topk(num_keep_node - 1, dim=1, largest=True)
+                    # print(hidden_states.shape)
+                    top_score_nocls, _ = torch.sort(top_score_nocls, dim=-1)
+                    # top_indices_excluding_cls = top_score_nocls.squeeze()
+                    top_indices_excluding_cls = top_score_nocls
+
+                    #print('top_indices_excluding_cls.shape',top_indices_excluding_cls.shape)
+                    ########s
+                    cls_pos_tensor_hidden = hidden_states[:, cls_pos:cls_pos+1, :]
+                    cls_pos_tensor_res = residual[:, cls_pos:cls_pos+1, :]
+
+                    num_keep_node = math.ceil(N * token_keep_ratio)
+                    # if num_keep_node % 2 == 0:
+                    #     num_keep_node += 1  # Adjust K to be odd if necessary
+                    # _, top_score_nocls = score_nocls.topk(num_keep_node, dim=1)
+                    # top_score_nocls, _ = torch.sort(top_score_nocls, dim=-1)
+                    # hidden_states= torch.gather(hidden_states, 1, top_score_nocls[:, :, None].repeat(1, 1, hidden_states.size(-1)))
+                    # residual = torch.gather(residual, 1, top_score_nocls[:, :, None].repeat(1, 1, hidden_states.size(-1)))
+
+                    #print('cls_pos_tensor.shape',cls_pos_tensor.shape)
+                    middle_position = top_score_nocls.size(1) // 2
+                    #print('middle_position',middle_position)
+                    first_half = top_indices_excluding_cls[:,:middle_position]
+                    #print('first_half.shape',first_half.shape)
+                    second_half = top_indices_excluding_cls[:,middle_position:]
+                    #print('second_half.shape',second_half.shape)
+                    # Using torch.gather to extract the corresponding tokens
+
+                    # first_half_hidden= torch.gather(hidden_states, 1, first_half.unsqueeze(-1).expand(B, -1, hidden_states.size(2)))
+                    # second_half_hidden = torch.gather(hidden_states, 1, second_half.unsqueeze(-1).expand(B, -1, hidden_states.size(2)))
+                    # hidden_states = torch.cat((first_half_hidden, cls_pos_tensor_hidden, second_half_hidden), dim=1)
+
+                    # first_half_res = torch.gather(residual, 1, first_half.unsqueeze(-1).expand(B, -1, residual.size(2)))
+                    # second_half_res = torch.gather(residual, 1, second_half.unsqueeze(-1).expand(B, -1, residual.size(2)))
+                    # residual = torch.cat((first_half_res, cls_pos_tensor_res, second_half_res), dim=1)
+
+                    first_half_hidden = torch.gather(hidden_states, 1, first_half[:, :, None].repeat(1, 1, hidden_states.size(-1)))
+                    second_half_hidden = torch.gather(hidden_states, 1, second_half[:, :, None].repeat(1, 1, hidden_states.size(-1)))
+                    hidden_states = torch.cat((first_half_hidden, cls_pos_tensor_hidden, second_half_hidden), dim=1)
+
+                    first_half_res = torch.gather(residual, 1, first_half[:, :, None].repeat(1, 1, residual.size(-1)))
+                    second_half_res = torch.gather(residual, 1, second_half[:, :, None].repeat(1, 1, residual.size(-1)))
+                    residual = torch.cat((first_half_res, cls_pos_tensor_res, second_half_res), dim=1)
+
+                    # print(hidden_states)
+                    # print(residual)
+
+                    # print('hidden_states.shape, residual.shape',hidden_states.shape, residual.shape)
         else:
             # get two layers in a single for-loop
             for i in range(len(self.layers) // 2):
@@ -518,6 +597,16 @@ class VisionMamba(nn.Module):
                 prenorm=False,
                 residual_in_fp32=self.residual_in_fp32,
             )
+        
+        _, N, D = hidden_states.shape #_, N, _ = rollout.shape
+        # print('final overall sparsity', 1-torch.count_nonzero(hidden_states[0])/(N*D))
+        # print('final dim for each token', torch.count_nonzero(hidden_states[0], dim=1))
+        # print('final dense token', torch.count_nonzero(hidden_states[0], dim=1)/D)
+        # print('final token sparsity', torch.sum(1-torch.count_nonzero(hidden_states[0], dim=1)/D)/N)
+        token_position = (N-1)//2
+        #print('final token number', N)
+        #exit()
+        #print('token_position',token_position)
 
         # return only cls token if it exists
         if self.if_cls_token:
